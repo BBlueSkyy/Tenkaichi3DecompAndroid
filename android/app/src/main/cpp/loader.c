@@ -203,14 +203,20 @@ static int early_reserve(int i, uintptr_t lo, uintptr_t hi) {
     return sEarly[i].ok;
 }
 
-static uintptr_t sEngineLo, sEngineHi; /* the engine's range, reserved early (0: not) */
+static uintptr_t sEngineLo, sEngineHi; /* the engine's usual range, reserved early (0: not) */
+static uintptr_t sEngineFallback;       /* a safe below-4GB relocation slot, held before SDL/driver startup */
 static intptr_t sBias;                   /* where the engine was loaded less where it was linked */
+static uintptr_t find_low(size_t size);
 
 __attribute__((constructor)) static void reserve_early(void) {
     uintptr_t page = (uintptr_t)sysconf(_SC_PAGESIZE);
     Dl_info info;
-    early_reserve(0, 0x003BE000u & ~(page - 1), 0x03000000u); /* PS2 heap, then the game thread's stack */
-    early_reserve(1, 0x05000000u, 0x0F000000u);                 /* the port's region */
+    /* Reserve the heap independently. On some ART layouts (e.g. 0x02000000-0x22000000)
+       the stack is occupied while 0x003BE000-0x02000000 is still free. Reserving both
+       as one span used to lose the heap reservation unnecessarily. */
+    early_reserve(0, 0x003BE000u & ~(page - 1), 0x02000000u); /* the game's heap */
+    early_reserve(2, 0x02000000u, 0x03000000u);               /* preferred stack; optional */
+    early_reserve(1, 0x05000000u, 0x0F000000u);               /* preferred port region */
     if (dladdr((void *)reserve_early, &info) != 0 && info.dli_fname != NULL) {
         char engine[1024];
         const char *slash = strrchr(info.dli_fname, '/');
@@ -222,6 +228,14 @@ __attribute__((constructor)) static void reserve_early(void) {
             if (early_reserve(4, lo, hi)) {
                 sEngineLo = lo;
                 sEngineHi = hi;
+            } else {
+                /* A device's Java heap may cover 0x03000000. Keep an alternative free
+                   before SDL and the GPU driver can occupy it; never unmap ART memory. */
+                sEngineFallback = find_low(hi - lo);
+                if (sEngineFallback != 0) {
+                    __android_log_print(ANDROID_LOG_INFO, TAG, "early: engine relocation slot 0x%lx-0x%lx",
+                                        (unsigned long)sEngineFallback, (unsigned long)(sEngineFallback + hi - lo));
+                }
             }
         }
     }
@@ -603,8 +617,17 @@ int SDL_main(int argc, char *argv[]) {
         int haveRel;
         snprintf(relpath, sizeof(relpath), "%s/libbt3.so.rel", dir);
         haveRel = read_rel(relpath, &sRel);
+        if (haveRel && sRel.base != lo) {
+            say("engine relocation list has base 0x%x, expected 0x%lx", sRel.base, (unsigned long)lo);
+            free(sRel.words);
+            memset(&sRel, 0, sizeof(sRel));
+            haveRel = 0;
+        }
+        say("engine relocation list: %s", haveRel ? "available" : "missing or incompatible");
         if (sEngineLo == lo && sEngineHi == hi) {
             region = (void *)lo; /* (claimed when this library was loaded) */
+        } else if (sEngineFallback != 0) {
+            region = (void *)sEngineFallback; /* (claimed before SDL and GPU startup) */
         } else {
             region = mmap((void *)lo, hi - lo, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
         }
@@ -619,20 +642,27 @@ int SDL_main(int argc, char *argv[]) {
                 return 1;
             }
         } else if (region != (void *)lo) {
-            if (region != MAP_FAILED) {
+            if (region != MAP_FAILED && region != (void *)sEngineFallback) {
                 munmap(region, hi - lo);
             }
             say("the engine's usual range 0x%lx-0x%lx is taken in this process", (unsigned long)lo, (unsigned long)hi);
-            log_low_maps();
             if (!haveRel) {
                 say("no relocation list (%s): the engine cannot be moved", relpath);
+                log_low_maps();
                 return 1;
             }
-            region = (void *)find_low(hi - lo);
+            if (sEngineFallback == 0) {
+                say("searching for a free engine relocation slot below 4 GB");
+                region = (void *)find_low(hi - lo);
+            } else {
+                region = (void *)sEngineFallback;
+            }
             if (region == NULL) {
                 say("no free place below 4 GB for the engine (%lu KB)", (unsigned long)((hi - lo) >> 10));
+                log_low_maps();
                 return 1;
             }
+            say("engine relocation slot: 0x%lx", (unsigned long)(uintptr_t)region);
         }
         sBias = (intptr_t)((uintptr_t)region - lo);
     }
